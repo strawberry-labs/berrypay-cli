@@ -2,6 +2,9 @@ import { Command } from "commander";
 import chalk from "chalk";
 import ora from "ora";
 import * as path from "path";
+import * as fs from "fs";
+import * as os from "os";
+import { spawn } from "child_process";
 import QRCode from "qrcode";
 import { BerryPayWallet } from "../wallet.js";
 import { BlockLatticeMonitor } from "../monitor.js";
@@ -18,6 +21,43 @@ import {
   getConfigPath,
 } from "../config.js";
 
+const LISTENER_PID_FILE = path.join(os.homedir(), ".berrypay", "listener.pid");
+
+function isListenerRunning(): boolean {
+  try {
+    if (fs.existsSync(LISTENER_PID_FILE)) {
+      const pid = parseInt(fs.readFileSync(LISTENER_PID_FILE, "utf-8").trim());
+      // Check if process is running
+      process.kill(pid, 0);
+      return true;
+    }
+  } catch {
+    // Process not running or PID file doesn't exist
+    if (fs.existsSync(LISTENER_PID_FILE)) {
+      fs.unlinkSync(LISTENER_PID_FILE);
+    }
+  }
+  return false;
+}
+
+function startListenerInBackground(): void {
+  const berrypayPath = process.argv[1]; // Path to current CLI
+
+  const child = spawn(process.execPath, [berrypayPath, "charge", "listen"], {
+    detached: true,
+    stdio: "ignore",
+  });
+
+  child.unref();
+
+  // Save PID
+  const dir = path.dirname(LISTENER_PID_FILE);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  fs.writeFileSync(LISTENER_PID_FILE, String(child.pid));
+}
+
 const program = new Command();
 
 function getWallet(): BerryPayWallet {
@@ -29,6 +69,20 @@ function getWallet(): BerryPayWallet {
   }
 
   return new BerryPayWallet({ seed, rpcUrl: getRpcUrl() });
+}
+
+// Auto-receive pending on main wallet (runs silently in background)
+async function autoReceiveMain(wallet: BerryPayWallet): Promise<number> {
+  try {
+    const pending = await wallet.getPendingBlocks(0);
+    if (pending.length > 0) {
+      const received = await wallet.receivePending(0);
+      return received.length;
+    }
+  } catch {
+    // Silently ignore errors - this is a background task
+  }
+  return 0;
 }
 
 program
@@ -123,7 +177,7 @@ program
 
 program
   .command("balance")
-  .description("Show balance")
+  .description("Show balance (auto-receives pending)")
   .option("-i, --index <index>", "Account index", "0")
   .option("--json", "Output only JSON")
   .action(async (options) => {
@@ -131,9 +185,21 @@ program
     const index = parseInt(options.index);
     const address = wallet.getAddress(index);
 
-    const spinner = options.json ? null : ora("Fetching balance...").start();
+    const spinner = options.json ? null : ora("Checking balance...").start();
 
     try {
+      // Auto-receive pending first
+      if (index === 0) {
+        const received = await autoReceiveMain(wallet);
+        if (received > 0) {
+          // Wait for node to update
+          await new Promise(resolve => setTimeout(resolve, 500));
+          if (!options.json) {
+            spinner?.succeed(`Auto-received ${received} pending block(s)`);
+          }
+        }
+      }
+
       const { balance, pending } = await wallet.getBalance(index);
       spinner?.stop();
 
@@ -143,7 +209,9 @@ program
       if (!options.json) {
         console.log(chalk.cyan("Address:"), address);
         console.log(chalk.green("Balance:"), balanceNano, "XNO");
-        console.log(chalk.yellow("Pending:"), pendingNano, "XNO");
+        if (BigInt(pending) > BigInt(0)) {
+          console.log(chalk.yellow("Pending:"), pendingNano, "XNO");
+        }
       }
 
       console.log(JSON.stringify({
@@ -162,7 +230,7 @@ program
 
 program
   .command("send")
-  .description("Send XNO to an address")
+  .description("Send XNO to an address (auto-receives pending first)")
   .argument("<address>", "Recipient address")
   .argument("<amount>", "Amount in XNO")
   .option("-i, --index <index>", "Account index", "0")
@@ -182,6 +250,14 @@ program
     const wallet = getWallet();
     const index = parseInt(options.index);
     const amountRaw = BerryPayWallet.nanoToRaw(amount);
+
+    // Auto-receive pending first to have full balance available
+    if (index === 0) {
+      const received = await autoReceiveMain(wallet);
+      if (received > 0) {
+        console.log(chalk.green(`Auto-received ${received} pending block(s)`));
+      }
+    }
 
     if (!options.yes) {
       console.log(chalk.cyan("Sending:"), amount, "XNO");
@@ -254,7 +330,7 @@ program
 
 program
   .command("watch")
-  .description("Watch for incoming payments")
+  .description("Watch for incoming payments (auto-receives)")
   .option("-i, --index <index>", "Account index", "0")
   .action(async (options) => {
     const wallet = getWallet();
@@ -262,6 +338,18 @@ program
     const address = wallet.getAddress(index);
 
     console.log(chalk.cyan("Watching:"), address);
+
+    // First receive any existing pending
+    const existingPending = await wallet.getPendingBlocks(index);
+    if (existingPending.length > 0) {
+      console.log(chalk.yellow(`Found ${existingPending.length} pending block(s), receiving...`));
+      const received = await wallet.receivePending(index);
+      console.log(chalk.green(`Received ${received.length} block(s)`));
+      for (const r of received) {
+        console.log(chalk.gray("  -"), r.hash, BerryPayWallet.rawToNano(r.amount), "XNO");
+      }
+    }
+
     console.log(chalk.gray("Press Ctrl+C to stop.\n"));
 
     const monitor = new BlockLatticeMonitor({
@@ -386,6 +474,8 @@ charge
   .description("Create a new payment charge")
   .argument("<amount>", "Amount in XNO")
   .option("-t, --timeout <minutes>", "Timeout in minutes", "30")
+  .option("-w, --webhook <url>", "Webhook URL to call when payment is completed")
+  .option("-m, --metadata <json>", "JSON metadata to include in webhook")
   .option("--qr", "Show QR code")
   .option("-o, --output <path>", "Save QR image")
   .action(async (amount: string, options) => {
@@ -395,17 +485,42 @@ charge
       process.exit(1);
     }
 
+    let metadata: Record<string, unknown> | undefined;
+    if (options.metadata) {
+      try {
+        metadata = JSON.parse(options.metadata);
+      } catch {
+        console.error(chalk.red("Invalid metadata JSON."));
+        process.exit(1);
+      }
+    }
+
     const wallet = getWallet();
     const processor = new PaymentProcessor({ wallet, autoSweep: true });
 
     const timeoutMs = parseInt(options.timeout) * 60 * 1000;
-    const chargeData = await processor.createCharge({ amountNano: amount, timeoutMs });
+    const chargeData = await processor.createCharge({
+      amountNano: amount,
+      timeoutMs,
+      webhookUrl: options.webhook,
+      metadata,
+    });
 
-    console.log(chalk.green("Charge created!\n"));
+    // Auto-start listener if not running
+    if (!isListenerRunning()) {
+      startListenerInBackground();
+      console.log(chalk.green("Listener started in background"));
+    }
+
+    console.log(chalk.green("\nCharge created!"));
     console.log(chalk.cyan("  ID:"), chargeData.id);
     console.log(chalk.cyan("  Amount:"), chargeData.amountNano, "XNO");
     console.log(chalk.cyan("  Address:"), chargeData.address);
     console.log(chalk.cyan("  Expires:"), chargeData.expiresAt.toLocaleString());
+    if (options.webhook) {
+      console.log(chalk.cyan("  Webhook:"), options.webhook);
+    }
+    console.log(chalk.gray("  Listener:"), "running");
 
     if (options.qr) {
       const terminalQR = await QRCode.toString(chargeData.address, { type: "terminal", small: true });
@@ -424,6 +539,8 @@ charge
       amount: chargeData.amountNano,
       amountRaw: chargeData.amountRaw,
       expiresAt: chargeData.expiresAt.toISOString(),
+      webhookUrl: options.webhook,
+      metadata,
     }, null, 2));
   });
 
@@ -432,12 +549,20 @@ charge
   .description("Start payment processor and listen for payments")
   .option("--no-auto-sweep", "Disable auto-sweep")
   .action(async (options) => {
+    // Write PID file
+    const dir = path.dirname(LISTENER_PID_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(LISTENER_PID_FILE, String(process.pid));
+
     const wallet = getWallet();
     const mainAddress = wallet.getAddress(0);
 
     console.log(chalk.cyan("Payment Processor"));
     console.log(chalk.gray("  Main wallet:"), mainAddress);
     console.log(chalk.gray("  Auto-sweep:"), options.autoSweep ? "Yes" : "No");
+    console.log(chalk.gray("  PID:"), process.pid);
     console.log(chalk.gray("\nListening... Ctrl+C to stop.\n"));
 
     const processor = new PaymentProcessor({
@@ -445,6 +570,17 @@ charge
       autoSweep: options.autoSweep,
       wsUrl: getWsUrl(),
     });
+
+    // Cleanup function for graceful shutdown
+    const cleanup = () => {
+      processor.stop();
+      try {
+        if (fs.existsSync(LISTENER_PID_FILE)) {
+          fs.unlinkSync(LISTENER_PID_FILE);
+        }
+      } catch { /* ignore */ }
+      process.exit(0);
+    };
 
     processor.on("state:loaded", ({ chargeCount }) => {
       if (chargeCount > 0) console.log(chalk.blue(`Loaded ${chargeCount} charge(s) from disk`));
@@ -476,24 +612,57 @@ charge
       console.log(JSON.stringify({ event: "charge:completed", id: c.id, received: c.receivedNano }));
     });
 
+    // Check if listener should auto-stop (no active charges)
+    const checkAutoStop = () => {
+      const active = processor.listActiveCharges();
+      if (active.length === 0) {
+        console.log(chalk.gray("\nNo active charges remaining. Stopping listener..."));
+        console.log(JSON.stringify({ event: "listener:stopped", reason: "no_active_charges" }));
+        cleanup();
+      }
+    };
+
     processor.on("charge:swept", ({ charge, hash, amountNano }) => {
       console.log(chalk.green(`\nSwept to main wallet: ${amountNano} XNO`));
       console.log(JSON.stringify({ event: "charge:swept", chargeId: charge.id, amount: amountNano, hash, to: mainAddress }));
+      // Check if we should auto-stop after sweep
+      setTimeout(checkAutoStop, 1000);
     });
 
     processor.on("charge:expired", (c: Charge) => {
       console.log(chalk.red(`\nCharge EXPIRED: ${c.id}`));
       console.log(JSON.stringify({ event: "charge:expired", id: c.id, received: c.receivedNano }));
+      // Check if we should auto-stop after expiry
+      setTimeout(checkAutoStop, 1000);
+    });
+
+    processor.on("webhook:sent", ({ chargeId, url }) => {
+      console.log(chalk.green(`\nWebhook sent for ${chargeId}`));
+      console.log(JSON.stringify({ event: "webhook:sent", chargeId, url }));
+    });
+
+    processor.on("webhook:failed", ({ chargeId, url, status, statusText }) => {
+      console.log(chalk.red(`\nWebhook failed for ${chargeId}: ${status} ${statusText}`));
+      console.log(JSON.stringify({ event: "webhook:failed", chargeId, url, status, statusText }));
+    });
+
+    processor.on("webhook:error", ({ chargeId, url, error }) => {
+      console.log(chalk.red(`\nWebhook error for ${chargeId}: ${error}`));
+      console.log(JSON.stringify({ event: "webhook:error", chargeId, url, error }));
     });
 
     processor.on("error", (err) => console.error(chalk.red("Error:"), err.message));
 
     await processor.start();
 
-    process.on("SIGINT", () => {
-      processor.stop();
-      process.exit(0);
-    });
+    // Check if we should auto-stop immediately (no active charges loaded)
+    const activeOnStart = processor.listActiveCharges();
+    if (activeOnStart.length === 0) {
+      console.log(chalk.gray("No active charges. Waiting for new charges..."));
+    }
+
+    process.on("SIGINT", cleanup);
+    process.on("SIGTERM", cleanup);
   });
 
 charge
@@ -703,6 +872,47 @@ charge
     const count = processor.cleanupSweptCharges();
     console.log(chalk.green(`Cleaned up ${count} charge(s)`));
     console.log(JSON.stringify({ cleaned: count }, null, 2));
+  });
+
+charge
+  .command("listener")
+  .description("Check if payment listener is running")
+  .action(() => {
+    const running = isListenerRunning();
+    let pid: number | null = null;
+
+    if (running) {
+      try {
+        pid = parseInt(fs.readFileSync(LISTENER_PID_FILE, "utf-8").trim());
+      } catch { /* ignore */ }
+    }
+
+    console.log(chalk.cyan("Listener:"), running ? chalk.green("running") : chalk.red("stopped"));
+    if (pid) {
+      console.log(chalk.gray("  PID:"), pid);
+    }
+    console.log(JSON.stringify({ running, pid }, null, 2));
+  });
+
+charge
+  .command("stop")
+  .description("Stop the payment listener")
+  .action(() => {
+    if (!isListenerRunning()) {
+      console.log(chalk.yellow("Listener is not running"));
+      console.log(JSON.stringify({ stopped: false, reason: "not running" }, null, 2));
+      return;
+    }
+
+    try {
+      const pid = parseInt(fs.readFileSync(LISTENER_PID_FILE, "utf-8").trim());
+      process.kill(pid, "SIGTERM");
+      console.log(chalk.green(`Stopped listener (PID ${pid})`));
+      console.log(JSON.stringify({ stopped: true, pid }, null, 2));
+    } catch (error) {
+      console.error(chalk.red("Failed to stop listener:"), (error as Error).message);
+      console.log(JSON.stringify({ stopped: false, error: (error as Error).message }, null, 2));
+    }
   });
 
 export { program };

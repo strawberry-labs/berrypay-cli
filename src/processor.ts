@@ -23,6 +23,9 @@ export interface Charge {
   completedAt?: Date;
   sweptAt?: Date;
   sweepTxHash?: string;
+  webhookUrl?: string;
+  webhookSent?: boolean;
+  metadata?: Record<string, unknown>;
 }
 
 export interface PaymentTransaction {
@@ -93,6 +96,7 @@ export interface CreateChargeOptions {
   amountNano: string;
   timeoutMs?: number;
   metadata?: Record<string, unknown>;
+  webhookUrl?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
@@ -300,6 +304,8 @@ export class PaymentProcessor extends EventEmitter {
       transactions: [],
       createdAt: new Date(),
       expiresAt: new Date(Date.now() + timeoutMs),
+      webhookUrl: options.webhookUrl,
+      metadata: options.metadata,
     };
 
     this.charges.set(id, charge);
@@ -385,6 +391,59 @@ export class PaymentProcessor extends EventEmitter {
     }
   }
 
+  private async callWebhook(charge: Charge, sweepHash: string, amountRaw: string): Promise<void> {
+    if (!charge.webhookUrl) return;
+
+    const payload = {
+      event: "charge.completed",
+      charge: {
+        id: charge.id,
+        address: charge.address,
+        amountNano: charge.amountNano,
+        amountRaw: charge.amountRaw,
+        receivedNano: charge.receivedNano,
+        receivedRaw: charge.receivedRaw,
+        status: charge.status,
+        sweepTxHash: sweepHash,
+        sweptAmountNano: BerryPayWallet.rawToNano(amountRaw),
+        sweptAmountRaw: amountRaw,
+        completedAt: charge.completedAt?.toISOString(),
+        sweptAt: charge.sweptAt?.toISOString(),
+        metadata: charge.metadata,
+      },
+      timestamp: new Date().toISOString(),
+    };
+
+    try {
+      const response = await fetch(charge.webhookUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.ok) {
+        charge.webhookSent = true;
+        this.persistStateNow();
+        this.emit("webhook:sent", { chargeId: charge.id, url: charge.webhookUrl });
+      } else {
+        this.emit("webhook:failed", {
+          chargeId: charge.id,
+          url: charge.webhookUrl,
+          status: response.status,
+          statusText: response.statusText,
+        });
+      }
+    } catch (error) {
+      this.emit("webhook:error", {
+        chargeId: charge.id,
+        url: charge.webhookUrl,
+        error: (error as Error).message,
+      });
+    }
+  }
+
   async sweepCharge(chargeId: string): Promise<{ hash: string; amount: string } | null> {
     const charge = this.charges.get(chargeId);
     if (!charge) {
@@ -429,6 +488,11 @@ export class PaymentProcessor extends EventEmitter {
         amount: balance,
         amountNano: BerryPayWallet.rawToNano(balance),
       });
+
+      // Call webhook if configured
+      if (charge.webhookUrl && !charge.webhookSent) {
+        await this.callWebhook(charge, result.hash, balance);
+      }
 
       return { hash: result.hash, amount: balance };
     } catch (error) {
