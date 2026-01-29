@@ -154,24 +154,30 @@ export class BerryPayWallet {
     const address = this.getAddress(accountIndex);
 
     try {
-      const result = (await this.rpcCall("receivable", {
+      const result = (await this.rpcCall("pending", {
         account: address,
         count: count.toString(),
         source: true,
-        include_only_confirmed: true,
       })) as {
-        blocks: Record<string, { amount: string; source: string }> | string;
+        blocks: Record<string, { amount: string; source: string } | string> | string;
       };
 
       if (!result.blocks || typeof result.blocks === "string") {
         return [];
       }
 
-      return Object.entries(result.blocks).map(([hash, info]) => ({
-        hash,
-        amount: info.amount,
-        source: info.source,
-      }));
+      // Handle both formats: { hash: { amount, source } } and { hash: amount }
+      return Object.entries(result.blocks).map(([hash, info]) => {
+        if (typeof info === "string") {
+          // Old format: { hash: amount }
+          return { hash, amount: info, source: "" };
+        }
+        return {
+          hash,
+          amount: info.amount,
+          source: info.source,
+        };
+      });
     } catch {
       return [];
     }
@@ -276,12 +282,21 @@ export class BerryPayWallet {
     const pending = await this.getPendingBlocks(accountIndex);
     const results: ReceiveResult[] = [];
 
+    if (pending.length === 0) {
+      // Debug: check if there's actually pending via balance check
+      const { pending: pendingRaw } = await this.getBalance(accountIndex);
+      if (BigInt(pendingRaw) > BigInt(0)) {
+        console.error(`Warning: Balance shows ${pendingRaw} pending but getPendingBlocks returned empty`);
+      }
+    }
+
     for (const pendingBlock of pending) {
       try {
         const result = await this.receive(pendingBlock.hash, pendingBlock.amount, accountIndex);
         results.push(result);
       } catch (error) {
-        console.error(`Failed to receive ${pendingBlock.hash}:`, error);
+        // Re-throw to make errors visible
+        throw new Error(`Failed to receive ${pendingBlock.hash}: ${(error as Error).message}`);
       }
     }
 

@@ -620,7 +620,8 @@ charge
   .command("sweep")
   .description("Manually sweep funds from a charge to main wallet")
   .argument("<id>", "Charge ID")
-  .action(async (id: string) => {
+  .option("-v, --verbose", "Show debug output")
+  .action(async (id: string, options: { verbose?: boolean }) => {
     const wallet = getWallet();
     const processor = new PaymentProcessor({ wallet });
 
@@ -634,8 +635,43 @@ charge
     const spinner = ora("Sweeping funds to main wallet...").start();
 
     try {
+      if (options.verbose) {
+        spinner.stop();
+        console.log(chalk.gray("Account index:"), charge.accountIndex);
+        console.log(chalk.gray("Address:"), charge.address);
+      }
+
+      // Check balance before
+      const balanceBefore = await wallet.getBalance(charge.accountIndex);
+      if (options.verbose) {
+        console.log(chalk.gray("Balance before receive:"), BerryPayWallet.rawToNano(balanceBefore.balance), "XNO");
+        console.log(chalk.gray("Pending before receive:"), BerryPayWallet.rawToNano(balanceBefore.pending), "XNO");
+      }
+
+      // Get pending blocks
+      const pendingBlocks = await wallet.getPendingBlocks(charge.accountIndex);
+      if (options.verbose) {
+        console.log(chalk.gray("Pending blocks found:"), pendingBlocks.length);
+        for (const pb of pendingBlocks) {
+          console.log(chalk.gray("  -"), pb.hash, BerryPayWallet.rawToNano(pb.amount), "XNO");
+        }
+      }
+
       // First receive any pending blocks
-      await wallet.receivePending(charge.accountIndex);
+      if (options.verbose && pendingBlocks.length > 0) {
+        console.log(chalk.gray("Receiving pending blocks..."));
+      }
+      const received = await wallet.receivePending(charge.accountIndex);
+      if (options.verbose) {
+        console.log(chalk.gray("Received:"), received.length, "blocks");
+      }
+
+      // Check balance after
+      const balanceAfter = await wallet.getBalance(charge.accountIndex);
+      if (options.verbose) {
+        console.log(chalk.gray("Balance after receive:"), BerryPayWallet.rawToNano(balanceAfter.balance), "XNO");
+        spinner.start();
+      }
 
       const result = await processor.sweepCharge(id);
 
