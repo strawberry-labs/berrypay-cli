@@ -391,15 +391,16 @@ export class PaymentProcessor extends EventEmitter {
       throw new Error("Charge not found");
     }
 
-    if (charge.status !== "completed" && charge.status !== "partial") {
-      throw new Error("Charge has no funds to sweep");
+    // Already swept
+    if (charge.status === "swept") {
+      return null;
     }
 
     try {
       // First receive any pending transactions on the ephemeral address
       await this.wallet.receivePending(charge.accountIndex);
 
-      // Get the balance
+      // Get the balance after receiving
       const { balance } = await this.wallet.getBalance(charge.accountIndex);
 
       if (balance === "0" || BigInt(balance) === BigInt(0)) {

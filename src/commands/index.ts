@@ -539,10 +539,15 @@ charge
       // If fully paid and sweep enabled, sweep to main
       if (isPaid && options.sweep && chargeData.status !== "swept") {
         spinner.text = "Sweeping to main wallet...";
-        const result = await processor.sweepCharge(id);
-        if (result) {
-          swept = true;
-          sweepHash = result.hash;
+        try {
+          const result = await processor.sweepCharge(id);
+          if (result) {
+            swept = true;
+            sweepHash = result.hash;
+          }
+        } catch (sweepError) {
+          spinner.warn("Sweep failed: " + (sweepError as Error).message);
+          // Continue to show status even if sweep failed
         }
       }
 
