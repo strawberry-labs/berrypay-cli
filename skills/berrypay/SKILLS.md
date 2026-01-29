@@ -1,3 +1,8 @@
+---
+name: berrypay
+description: Manage Nano (XNO) cryptocurrency wallet operations using BerryPay CLI. Use for checking balance, sending/receiving XNO, creating payment charges with webhooks, generating QR codes, and processing payments with automatic sweeping.
+---
+
 # BerryPay CLI - AI Agent Skill Guide
 
 BerryPay is a Nano (XNO) cryptocurrency wallet CLI designed for AI agents. It provides passwordless operation, JSON output for parsing, and a payment processor for accepting payments with automatic sweeping.
