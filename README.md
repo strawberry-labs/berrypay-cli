@@ -154,7 +154,7 @@ const charge = await processor.createCharge({
 
 ## AI Agent Skill Guide
 
-See [skills/berrypay/SKILLS.md](./skills/berrypay/SKILLS.md) for a comprehensive guide on using BerryPay CLI as an AI agent.
+See [skills/berrypay/SKILL.md](./skills/berrypay/SKILL.md) for a comprehensive guide on using BerryPay CLI as an AI agent.
 
 ## Storage
 
